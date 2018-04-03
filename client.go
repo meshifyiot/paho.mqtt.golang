@@ -23,6 +23,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"container/list"
+
 	"github.com/eclipse/paho.mqtt.golang/packets"
 )
 
@@ -87,6 +89,151 @@ type Client interface {
 	OptionsReader() ClientOptionsReader
 }
 
+type respPacket uint8
+
+const (
+	puback respPacket = iota
+	pubrec
+	pubcomp
+)
+
+type respData struct {
+	respPacket
+	id         uint16
+	enqueueCB  func()
+	writeOutCB func(error)
+}
+
+type publishData struct {
+	id  uint16
+	qos uint8
+}
+
+// respHandler handles sending out responses to QOS 1 and 2 PUBLISH messages.
+//
+// This is function should only be used when message ordering is desired.
+//
+// This function should run in a separate goroutine as it has an infinite loop
+// for processing message IDs and packet types.
+func (c *client) respHandler() {
+	// Sends the response packets in the same order in which the corresponding
+	// PUBLISH messages were received (MQTT Specification 3.1.1 Section 4.6).
+	//
+	// Stops once there are no more responses to send or if next expected
+	// message is not ready.
+	//
+	// eCB and wCB are the enqueue and write callbacks for the packet. These are
+	// called after enqueuing and writing out the packet, respectively.
+	sendReady := func(m map[uint16]struct{}, l *list.List, fn func(uint16) *PacketAndToken, eCB func(), wCB func(error)) {
+		for {
+			if l.Len() == 0 {
+				return
+			}
+			front := l.Front()
+			frontID := front.Value.(uint16)
+			if _, ok := m[frontID]; ok {
+				pt := fn(frontID)
+
+				wCBErrC := make(chan error)
+				wCBIntercept := func(e error) {
+					wCBErrC <- e
+					if wCB != nil {
+						wCB(e)
+					}
+				}
+				pt.sentCB = wCBIntercept
+
+				select {
+				case <-c.stop:
+					return
+				default:
+				}
+
+				// Enqueue the packet to send, call the enqueue callback, then
+				// call the write callback once a write happens.
+				//
+				// The packet will only be considered sent if there is no error
+				// sending it. (Isn't this wrong?)
+				select {
+				case c.oboundP <- pt:
+					if eCB != nil {
+						eCB()
+					}
+					select {
+					case e := <-wCBErrC:
+						if e == nil {
+							l.Remove(front)
+							delete(m, frontID)
+						}
+					case <-c.stop:
+						return
+					}
+				case <-c.stop:
+					return
+				}
+			} else {
+				return
+			}
+		}
+	}
+
+	newPuback := func(u uint16) *PacketAndToken {
+		pa := packets.NewControlPacket(packets.Puback).(*packets.PubackPacket)
+		pa.MessageID = u
+		return &PacketAndToken{p: pa}
+	}
+
+	newPubrec := func(u uint16) *PacketAndToken {
+		pa := packets.NewControlPacket(packets.Pubrec).(*packets.PubrecPacket)
+		pa.MessageID = u
+		return &PacketAndToken{p: pa}
+	}
+
+	newPubcomp := func(u uint16) *PacketAndToken {
+		pa := packets.NewControlPacket(packets.Pubcomp).(*packets.PubcompPacket)
+		pa.MessageID = u
+		return &PacketAndToken{p: pa}
+	}
+
+	// As PUBLISH packets are received, the PUBLISH IDs are inserted into lists
+	// that maintain the order in which PUBLISH packets were received.
+	//
+	// Once the message is ready to send, the message/packet ID is inserted into
+	// sets of IDs for each response type.
+	//
+	// Each of the pairs of the publish lists and message/packet ID sets are
+	// then checked to see what, if any, packets may be sent out. The packets
+	// are then sent out and the IDs are removed from the list and set.
+	for {
+		select {
+		case d := <-c.responseC:
+			// Ready to send response packet.
+			switch d.respPacket {
+			case puback:
+				c.pubackReady[d.id] = struct{}{}
+			case pubrec:
+				c.pubrecReady[d.id] = struct{}{}
+			case pubcomp:
+				c.pubcompReady[d.id] = struct{}{}
+			}
+			sendReady(c.pubackReady, c.pubackQueue, newPuback, d.enqueueCB, d.writeOutCB)
+			sendReady(c.pubrecReady, c.pubrecQueue, newPubrec, d.enqueueCB, d.writeOutCB)
+			sendReady(c.pubcompReady, c.pubcompQueue, newPubcomp, d.enqueueCB, d.writeOutCB)
+		case p := <-c.publishC:
+			// Publish received.
+			switch p.qos {
+			case 1:
+				c.pubackQueue.PushBack(p.id)
+			case 2:
+				c.pubrecQueue.PushBack(p.id)
+				c.pubcompQueue.PushBack(p.id)
+			}
+		case <-c.stop:
+			return
+		}
+	}
+}
+
 // client implements the Client interface
 type client struct {
 	lastSent        int64
@@ -107,6 +254,23 @@ type client struct {
 	persist         Store
 	options         ClientOptions
 	workers         sync.WaitGroup
+
+	// Queues for sending out different packet types if message ordering is
+	// used. Message/Packet IDs of PUBLISH messages are added by the ACK
+	// callback.
+	pubackQueue  *list.List
+	pubrecQueue  *list.List
+	pubcompQueue *list.List
+
+	// Sets of message/packet IDs that are ready to be sent.
+	pubackReady  map[uint16]struct{}
+	pubrecReady  map[uint16]struct{}
+	pubcompReady map[uint16]struct{}
+
+	// Channel to enqueue a response packet to be sent.
+	responseC  chan respData
+	publishC   chan publishData
+	completedC chan uint16
 }
 
 // NewClient will create an MQTT v3.1.1 client with all of the options specified
@@ -135,6 +299,16 @@ func NewClient(o *ClientOptions) Client {
 	if !c.options.AutoReconnect {
 		c.options.MessageChannelDepth = 0
 	}
+
+	c.pubackQueue = list.New()
+	c.pubrecQueue = list.New()
+	c.pubcompQueue = list.New()
+	c.pubackReady = make(map[uint16]struct{})
+	c.pubrecReady = make(map[uint16]struct{})
+	c.pubcompReady = make(map[uint16]struct{})
+	c.responseC = make(chan respData)
+	c.publishC = make(chan publishData)
+	c.completedC = make(chan uint16)
 	return c
 }
 

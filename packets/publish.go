@@ -2,6 +2,7 @@ package packets
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 )
@@ -13,6 +14,43 @@ type PublishPacket struct {
 	TopicName string
 	MessageID uint16
 	Payload   []byte
+	AckCB     func() error
+}
+
+// ErrAckNotSent indicates that the acknowledgement has not been sent for the
+// corresponding message.
+var ErrAckNotSent = errors.New("message ack not sent")
+
+// ErrAckUnknown indicates that it is not known if the message acknowledgement
+// has been sent.
+//
+// This happens if the MQTT client is stopped after the packets is enqueued to
+// be sent, but the confirmation that the message has been sent has not been
+// received.
+var ErrAckUnknown = errors.New("message ack not confirmed")
+
+// SendAck sends an acknowledgement of receiving a given message.
+// This function blocks until the acknowledgement packet has been sent.
+//
+// This function works differently for the different QOS levels:
+//   QOS 0: Nothing is done.
+//   QOS 1: A PUBACK packet is sent.
+//   QOS 2: A PUBREC packet is sent.
+func (pp *PublishPacket) SendAck(messageID uint16, fn func(ControlPacket) error) error {
+	switch pp.Qos {
+	case 0:
+		return nil
+	case 1:
+		pr := NewControlPacket(Pubrec).(*PubrecPacket)
+		pr.MessageID = messageID
+		return fn(pr)
+	case 2:
+		pr := NewControlPacket(Pubrec).(*PubrecPacket)
+		pr.MessageID = messageID
+		return fn(pr)
+	default:
+		return errors.New("invalid QOS")
+	}
 }
 
 func (p *PublishPacket) String() string {

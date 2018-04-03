@@ -198,10 +198,13 @@ func outgoing(c *client) {
 			}
 			DEBUG.Println(NET, "obound priority msg to write, type", reflect.TypeOf(msg.p))
 			if err := msg.p.Write(c.conn); err != nil {
+				msg.sentCB(err)
 				ERROR.Println(NET, "outgoing stopped with error", err)
 				msg.t.setError(err)
 				signalError(c.errors, err)
 				return
+			} else if msg.sentCB != nil {
+				msg.sentCB(nil)
 			}
 			switch msg.p.(type) {
 			case *packets.DisconnectPacket:
@@ -213,6 +216,149 @@ func outgoing(c *client) {
 		// Reset ping timer after sending control packet.
 		if c.options.KeepAlive != 0 {
 			atomic.StoreInt64(&c.lastSent, time.Now().Unix())
+		}
+	}
+}
+
+// This returns the acknowledgement callback that the user is expected to call
+// (by way of the Message object).
+//
+// This is only for ordered responses.
+func genPacketCB(id uint16, respC chan<- respData, stopC <-chan struct{}, packet respPacket) func() error {
+	return func() error {
+		// Two different channels to differentiate between
+		// acknowledgement send statuses.
+		enqueue := make(chan struct{})
+		sent := make(chan error)
+
+		select {
+		case <-stopC:
+			return packets.ErrAckNotSent
+		default:
+		}
+
+		rd := respData{
+			id:         id,
+			respPacket: packet,
+			enqueueCB:  func() { close(enqueue) },
+			writeOutCB: func(e error) { sent <- e },
+		}
+
+		select {
+		case respC <- rd:
+		case <-stopC:
+			return packets.ErrAckNotSent
+		}
+
+		select {
+		case <-stopC:
+			return packets.ErrAckNotSent
+		default:
+		}
+
+		return func() (e error) {
+			// Always prefer sent channel over stopC channel.
+			defer func() {
+				t := time.NewTimer(25 * time.Millisecond)
+				defer t.Stop()
+
+				select {
+				case err := <-sent:
+					e = err
+				case <-t.C:
+				}
+			}()
+
+			select {
+			case <-enqueue:
+				select {
+				case err := <-sent:
+					return err
+				case <-stopC:
+					return packets.ErrAckUnknown
+				}
+			case <-stopC:
+				return packets.ErrAckNotSent
+			}
+		}()
+	}
+}
+
+// sendPacketDeferred returns a closure that sends the given ControlPacket when
+// called.
+func sendPacketDeferred(c *client, p packets.ControlPacket) func() error {
+	id, qos := p.Details().MessageID, p.Details().Qos
+	if c.options.Order {
+		switch qos {
+		case 0:
+			return nil
+		case 1:
+			c.publishC <- publishData{id: id, qos: qos}
+			return genPacketCB(p.Details().MessageID, c.responseC, c.stop, puback)
+		case 2:
+			c.publishC <- publishData{id: id, qos: qos}
+			return genPacketCB(p.Details().MessageID, c.responseC, c.stop, pubrec)
+		default:
+			panic("Invalid QOS")
+		}
+	} else {
+		return func() (e error) {
+			defer func() {
+				if r := recover(); r != nil {
+					e = fmt.Errorf("recovery: %+v", r)
+				}
+			}()
+			sent := make(chan error)
+			pt := &PacketAndToken{p: p,
+				sentCB: func(e error) {
+					sent <- e
+				},
+			}
+			// Due to Go randomly selecting a case in select blocks in the event
+			// of multiple channel being ready simultaneously, this is
+			// necessary.
+			// Because the stop channel may be closed before this function is
+			// called, it is effectively random if the packet send case or the
+			// stop receive case is taken. This prevents the message from being
+			// sent when the stop channel is closed.
+			select {
+			case <-c.stop:
+				return packets.ErrAckNotSent
+			default:
+			}
+
+			defer func() {
+				// This timer is to fix a case where the sent channel is about
+				// to be ready, but not quite ready. In the common, happy path,
+				// case, this timer will wait for almost no time.
+				//
+				// In tests, this brings the sent channel being preferred over
+				// the stop channel from 95+% of the time to 100% of the time.
+				t := time.NewTimer(25 * time.Millisecond)
+				defer t.Stop()
+				// time.Sleep(100 * time.Millisecond)
+				// This is select is used for the same reason as above, but
+				// after the receive. Since send can only return a value if it
+				// was written out, its error should be used.
+				select {
+				case err := <-sent:
+					e = err
+				case <-t.C:
+				}
+			}()
+
+			// Enqueue the packet to be sent and block until it is sent.
+			select {
+			case c.oboundP <- pt:
+				select {
+				case err := <-sent:
+					return err
+				case <-c.stop:
+					return packets.ErrAckUnknown
+				}
+			case <-c.stop:
+				return packets.ErrAckNotSent
+			}
 		}
 	}
 }
@@ -257,28 +403,42 @@ func alllogic(c *client) {
 				DEBUG.Println(NET, "putting msg on onPubChan")
 				switch m.Qos {
 				case 2:
-					c.incomingPubChan <- m
-					DEBUG.Println(NET, "done putting msg on incomingPubChan")
 					pr := packets.NewControlPacket(packets.Pubrec).(*packets.PubrecPacket)
 					pr.MessageID = m.MessageID
-					DEBUG.Println(NET, "putting pubrec msg on obound")
-					select {
-					case c.oboundP <- &PacketAndToken{p: pr, t: nil}:
-					case <-c.stop:
+					if c.options.DeferredAck {
+						pr.Qos = m.Qos
+						m.AckCB = sendPacketDeferred(c, pr)
+						c.incomingPubChan <- m
+						DEBUG.Println(NET, "done putting msg on incomingPubChan")
+					} else {
+						c.incomingPubChan <- m
+						DEBUG.Println(NET, "done putting msg on incomingPubChan")
+						DEBUG.Println(NET, "putting pubrec msg on obound")
+						select {
+						case c.oboundP <- &PacketAndToken{p: pr, t: nil}:
+						case <-c.stop:
+						}
+						DEBUG.Println(NET, "done putting pubrec msg on obound")
 					}
-					DEBUG.Println(NET, "done putting pubrec msg on obound")
 				case 1:
-					c.incomingPubChan <- m
-					DEBUG.Println(NET, "done putting msg on incomingPubChan")
 					pa := packets.NewControlPacket(packets.Puback).(*packets.PubackPacket)
 					pa.MessageID = m.MessageID
-					DEBUG.Println(NET, "putting puback msg on obound")
-					persistOutbound(c.persist, pa)
-					select {
-					case c.oboundP <- &PacketAndToken{p: pa, t: nil}:
-					case <-c.stop:
+					if c.options.DeferredAck {
+						pa.Qos = m.Qos
+						m.AckCB = sendPacketDeferred(c, pa)
+						c.incomingPubChan <- m
+						DEBUG.Println(NET, "done putting msg on incomingPubChan")
+					} else {
+						c.incomingPubChan <- m
+						DEBUG.Println(NET, "done putting msg on incomingPubChan")
+						DEBUG.Println(NET, "putting puback msg on obound")
+						persistOutbound(c.persist, pa)
+						select {
+						case c.oboundP <- &PacketAndToken{p: pa, t: nil}:
+						case <-c.stop:
+						}
+						DEBUG.Println(NET, "done putting puback msg on obound")
 					}
-					DEBUG.Println(NET, "done putting puback msg on obound")
 				case 0:
 					select {
 					case c.incomingPubChan <- m:
@@ -305,9 +465,17 @@ func alllogic(c *client) {
 				pc := packets.NewControlPacket(packets.Pubcomp).(*packets.PubcompPacket)
 				pc.MessageID = m.MessageID
 				persistOutbound(c.persist, pc)
-				select {
-				case c.oboundP <- &PacketAndToken{p: pc, t: nil}:
-				case <-c.stop:
+				if c.options.DeferredAck && c.options.Order {
+					pc.Qos = m.Qos
+					c.responseC <- respData{
+						id:         m.MessageID,
+						respPacket: pubcomp,
+					}
+				} else {
+					select {
+					case c.oboundP <- &PacketAndToken{p: pc, t: nil}:
+					case <-c.stop:
+					}
 				}
 			case *packets.PubcompPacket:
 				DEBUG.Println(NET, "received pubcomp, id:", m.MessageID)
