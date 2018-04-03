@@ -69,6 +69,7 @@ type ClientOptions struct {
 	OnConnectionLost        ConnectionLostHandler
 	WriteTimeout            time.Duration
 	MessageChannelDepth     uint
+	DeferredAck             bool
 }
 
 // NewClientOptions will create a new ClientClientOptions type with some
@@ -316,5 +317,25 @@ func (o *ClientOptions) SetAutoReconnect(a bool) *ClientOptions {
 // ignored.
 func (o *ClientOptions) SetMessageChannelDepth(s uint) *ClientOptions {
 	o.MessageChannelDepth = s
+	return o
+}
+
+// SetDeferredAck sets whether deferred message acknowledgement will be used.
+//
+// If this is set, all Messages received will need to be acknowledged using the
+// Ack method. The effect of not calling this function depends on is message
+// ordering is enabled.
+// If message ordering is enabled, not calling Ack will prevent acknowledgements
+// for subsequent messages from being sent until Ack is called.
+// If message ordering is disabled, not calling Ack will only not send the
+// acknowledgement for that one message.
+//
+// If this is unset, all Messages received will immediately and unconditionally
+// be acknowledged.
+// Calling the Ack method when this is unset will have no effect.
+//
+// This does not affect the usage or behavior of QOS 0 Messages received.
+func (o *ClientOptions) SetDeferredAck(a bool) *ClientOptions {
+	o.DeferredAck = a
 	return o
 }
