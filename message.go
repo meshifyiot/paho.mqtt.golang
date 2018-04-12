@@ -15,6 +15,8 @@
 package mqtt
 
 import (
+	"sync"
+
 	"github.com/eclipse/paho.mqtt.golang/packets"
 )
 
@@ -28,6 +30,7 @@ type Message interface {
 	Topic() string
 	MessageID() uint16
 	Payload() []byte
+	Ack() error
 }
 
 type message struct {
@@ -37,6 +40,8 @@ type message struct {
 	topic     string
 	messageID uint16
 	payload   []byte
+	ackOnce   sync.Once
+	ackCB     func() error
 }
 
 func (m *message) Duplicate() bool {
@@ -63,6 +68,23 @@ func (m *message) Payload() []byte {
 	return m.payload
 }
 
+// Ack acknowledges that the message has been processed.
+//
+// If the client has not been configured to enable unordered message processing,
+// then delays calling this acknowledgement function will delay acknowledgement
+// processing of all subsequent messages.
+//
+// Only the first call to this function will send an acknowledgement. Subsequent
+// calls will do nothing.
+func (m *message) Ack() (e error) {
+	m.ackOnce.Do(func() {
+		if m.ackCB != nil {
+			e = m.ackCB()
+		}
+	})
+	return
+}
+
 func messageFromPublish(p *packets.PublishPacket) Message {
 	return &message{
 		duplicate: p.Dup,
@@ -71,6 +93,7 @@ func messageFromPublish(p *packets.PublishPacket) Message {
 		topic:     p.TopicName,
 		messageID: p.MessageID,
 		payload:   p.Payload,
+		ackCB:     p.AckCB,
 	}
 }
 

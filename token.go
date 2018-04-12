@@ -23,9 +23,13 @@ import (
 //Token. This struct is passed via channels between the client interface
 //code and the underlying code responsible for sending and receiving
 //MQTT messages.
+//
+// The sentCB is a callback that is called when the packet is sent.
+// If the callback is nil, no attempt will be made to call the function.
 type PacketAndToken struct {
-	p packets.ControlPacket
-	t tokenCompletor
+	p      packets.ControlPacket
+	t      tokenCompletor
+	sentCB func(error)
 }
 
 //Token defines the interface for the tokens used to indicate when

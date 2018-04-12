@@ -13,6 +13,7 @@ type PublishPacket struct {
 	TopicName string
 	MessageID uint16
 	Payload   []byte
+	AckCB     func() error
 }
 
 func (p *PublishPacket) String() string {
