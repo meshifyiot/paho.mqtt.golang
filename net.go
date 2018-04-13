@@ -214,7 +214,11 @@ func outgoing(c *client) {
 					msg.sentCB(err)
 				}
 				ERROR.Println(NET, "outgoing stopped with error", err)
-				msg.t.setError(err)
+				if msg.t != nil {
+					msg.t.setError(err)
+				} else {
+					ERROR.Println(NET, "unexpected nil message token")
+				}
 				signalError(c.errors, err)
 				return
 			} else if msg.sentCB != nil {
