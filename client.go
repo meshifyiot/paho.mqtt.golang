@@ -214,7 +214,7 @@ func (c *client) Connect() Token {
 			DEBUG.Println(CLI, "about to write new connect msg")
 			c.Lock()
 			c.conn, err = openConnection(broker, &c.options.TLSConfig, c.options.ConnectTimeout)
-			c.Unlock
+			c.Unlock()
 			if err == nil {
 				DEBUG.Println(CLI, "socket connected to broker")
 				switch c.options.ProtocolVersion {
