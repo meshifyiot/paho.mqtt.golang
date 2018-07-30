@@ -134,9 +134,11 @@ func incoming(c *client) {
 	DEBUG.Println(NET, "incoming started")
 
 	for {
+		c.RLock()
 		if cp, err = packets.ReadPacket(c.conn); err != nil {
 			break
 		}
+		c.RUnlock()
 		DEBUG.Println(NET, "Received Message")
 		select {
 		case c.ibound <- cp:

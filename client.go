@@ -212,7 +212,9 @@ func (c *client) Connect() Token {
 			c.options.ProtocolVersion = protocolVersion
 		CONN:
 			DEBUG.Println(CLI, "about to write new connect msg")
+			c.Lock()
 			c.conn, err = openConnection(broker, &c.options.TLSConfig, c.options.ConnectTimeout)
+			c.Unlock
 			if err == nil {
 				DEBUG.Println(CLI, "socket connected to broker")
 				switch c.options.ProtocolVersion {
